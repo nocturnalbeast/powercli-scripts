@@ -1,24 +1,27 @@
-Write-Host "Connected" -Foregroundcolor "Green"
+param(
+    [Parameter(Mandatory=$false)]
+    [int]$DaysAgo = 30
+)
 
-$PoweredOffAge = (Get-Date).AddDays(-30)
-$Output = @{}
-$PoweredOffvms = Get-VM | where {$_.PowerState -eq "PoweredOff"}
-$EventsLog = Get-VIEvent -Entity $PoweredOffvms -Finish $PoweredOffAge  -MaxSamples ([int]::MaxValue) | where{$_.FullFormattedMessage -like "*is powered off"}
-If($EventsLog)
-{
-    $EventsLog | %{ if($Output[$_.Vm.Name] -lt $_.CreatedTime)
-        {
-            $Output[$_.Vm.Name] = $_.CreatedTime
+# Get the cutoff date
+$CutoffDate = (Get-Date).AddDays(-$DaysAgo)
+
+# Get powered off VMs and their last power off event
+$PoweredOffVMs = Get-VM | Where-Object {$_.PowerState -eq "PoweredOff"}
+$PowerOffEvents = Get-VIEvent -Entity $PoweredOffVMs -Finish $CutoffDate -Types Info | 
+    Where-Object {$_.FullFormattedMessage -like "*powered off*"} |
+    Group-Object -Property {$_.VM.Name} |
+    ForEach-Object {
+        $lastEvent = $_.Group | Sort-Object CreatedTime -Descending | Select-Object -First 1
+        [PSCustomObject]@{
+            VM = $lastEvent.VM.Name
+            'Powered Off Date' = $lastEvent.CreatedTime
         }
     }
-}
-$Result = $Output.getEnumerator() | select @{N="VM";E={$_.Key}},@{N="Powered Off Date";E={$_.Value}}
 
-If($Result)
-{
-    $Result | Format-Table -AutoSize
-}
-Else
-{
-    "NO VM's Powered off last 30 Days"
+# Display results
+if ($PowerOffEvents) {
+    $PowerOffEvents | Format-Table -AutoSize
+} else {
+    Write-Host "No VMs found powered off for $DaysAgo days or more"
 }
