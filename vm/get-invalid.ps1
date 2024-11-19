@@ -27,6 +27,10 @@
 	If specified, the script will not disconnect from the vCenter Server after completion.
 	This is useful when running multiple scripts in sequence.
 
+.PARAMETER CsvOutput
+	Optional path to export results to a CSV file. The directory specified in the path must exist.
+	If the file exists, it will be overwritten.
+
 .EXAMPLE
 	.\get-invalid-vms.ps1 -VSphereServer "vcenter.domain.com" -Username "administrator@vsphere.local" -Password "SecurePass123"
 	Connects to the specified vCenter Server using provided credentials and lists invalid VMs.
@@ -39,6 +43,10 @@
 	.\get-invalid-vms.ps1 -VSphereServer "vcenter.domain.com" -Username "administrator@vsphere.local" -Password "SecurePass123" -RetainConnection
 	Connects to the vCenter Server and keeps the connection open after completion.
 
+.EXAMPLE
+	.\get-invalid-vms.ps1 -VSphereServer "vcenter.domain.com" -Username "administrator@vsphere.local" -Password "SecurePass123" -CsvOutput "C:\reports\invalid-vms.csv"
+	Connects to the vCenter Server and exports the results to the specified CSV file. The directory "C:\reports" must exist.
+
 .NOTES
 	Author: nocturnalbeast
 	Version: 1.0.0
@@ -48,6 +56,7 @@
 	
 .OUTPUTS
 	Outputs a table of invalid/inaccessible VMs with their names and connection states.
+	If CsvOutput is specified, also exports the results to a CSV file.
 #>
 
 param(
@@ -64,8 +73,20 @@ param(
 	[switch]$UseExistingConnection = $false,
 
 	[Parameter(Mandatory = $false)]
-	[switch]$RetainConnection = $false
+	[switch]$RetainConnection = $false,
+
+	[Parameter(Mandatory = $false)]
+	[string]$CsvOutput
 )
+
+# Check CSV directory existence early if CSV output is specified
+if ($CsvOutput) {
+	$directory = Split-Path -Parent $CsvOutput
+	if ($directory -and !(Test-Path -Path $directory)) {
+		Write-Error "Output directory does not exist: $directory"
+		exit 1
+	}
+}
 
 # Configure PowerCLI to ignore invalid certificates quietly
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -DefaultVIServerMode Multiple -Scope Session 2>&1 | Out-Null
@@ -111,7 +132,20 @@ try {
 
 	# Format and output the results
 	if ($InvalidVMs) {
-		$InvalidVMs | Select-Object @{N = 'Name'; E = { $_.Name } }, @{N = 'ConnectionState'; E = { $_.Runtime.ConnectionState } } | Format-Table -AutoSize
+		$formattedVMs = $InvalidVMs | Select-Object @{N = 'Name'; E = { $_.Name } }, @{N = 'ConnectionState'; E = { $_.Runtime.ConnectionState } }
+		
+		# Display to console
+		$formattedVMs | Format-Table -AutoSize
+
+		# Export to CSV if path is provided
+		if ($CsvOutput) {
+			try {
+				$formattedVMs | Export-Csv -Path $CsvOutput -NoTypeInformation -Force
+				Write-Host "Results exported to: $CsvOutput" -ForegroundColor Green
+			} catch {
+				Write-Error "Failed to export results to CSV: $_"
+			}
+		}
 	} else {
 		Write-Host "No invalid or inaccessible VMs found."
 	}
