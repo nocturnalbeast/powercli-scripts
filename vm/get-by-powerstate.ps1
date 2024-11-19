@@ -63,7 +63,7 @@ param(
 	[string]$Username = $env:VSPHERE_USERNAME,
 
 	[Parameter(Mandatory = $false)]
-	[SecureString]$Password = $(if ($env:VSPHERE_PASSWORD) { ConvertTo-SecureString $env:VSPHERE_PASSWORD -AsPlainText -Force }),
+	[string]$Password = $env:VSPHERE_PASSWORD,
 
 	[Parameter(Mandatory = $true)]
 	[ValidateSet("PoweredOn", "PoweredOff")]
@@ -76,7 +76,10 @@ param(
 	[switch]$RetainConnection = $false,
 
 	[Parameter(Mandatory = $false)]
-	[string]$CsvOutput
+	[string]$CsvOutput,
+
+	[Parameter(Mandatory = $false)]
+	[int]$ThrottleLimit = 10  # Control parallel job limit
 )
 
 # Check CSV directory existence early if CSV output is specified
@@ -116,8 +119,8 @@ try {
 		}
 
 		# Create new connection
-		$SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-		$Credential = New-Object System.Management.Automation.PSCredential($Username, $SecurePassword)
+		$Credential = New-Object System.Management.Automation.PSCredential($Username, (ConvertTo-SecureString $Password -AsPlainText -Force))
+
 		$Server = Connect-VIServer -Server $VSphereServer -Credential $Credential -ErrorAction Stop 2>&1 | Out-Null
 		if (-not $?) {
 			Write-Error "Failed to authenticate to $VSphereServer"
@@ -132,7 +135,7 @@ try {
 	$VMs = Get-VM | Where-Object { $_.PowerState -eq $State }
 	
 	if ($VMs) {
-		# Get datastores and power events for efficiency
+		# Get all required data upfront
 		$Datastores = Get-Datastore | Select-Object Name, Id
 		$PowerEvents = Get-VIEvent -Entity $VMs -MaxSamples ([int]::MaxValue) | 
 			Where-Object { 
@@ -140,14 +143,22 @@ try {
 				($State -eq "PoweredOff" -and $_ -is [VMware.Vim.VmPoweredOffEvent])
 			} | 
 			Group-Object -Property { $_.Vm.Name }
-
-		# Process each VM
+		
+		# Pre-fetch hard disk information for all VMs
+		$VMDisks = @{}
 		foreach ($VM in $VMs) {
+			$VMDisks[$VM.Id] = [math]::Round((Get-HardDisk -VM $VM | Measure-Object -Property CapacityGB -Sum).Sum, 2)
+		}
+
+		# Create a script block for processing each VM
+		$ProcessVM = {
+			param($VM, $Datastores, $PowerEvents, $DiskInfo)
+			
 			$lastEvent = ($PowerEvents | Where-Object { $_.Group[0].Vm.Vm -eq $VM.Id }).Group | 
 				Sort-Object -Property CreatedTime -Descending | 
 				Select-Object -First 1
 
-			$row = [PSCustomObject]@{
+			[PSCustomObject]@{
 				VMName = $VM.Name
 				PowerState = $VM.PowerState
 				OS = $VM.Guest.OSFullName
@@ -156,11 +167,45 @@ try {
 				Datastore = ($Datastores | Where-Object { $_.Id -eq ($VM.DatastoreIdList | Select-Object -First 1) }).Name
 				NumCPU = $VM.NumCPU
 				MemMb = $VM.MemoryMB
-				DiskGb = [math]::Round((Get-HardDisk -VM $VM | Measure-Object -Property CapacityGB -Sum).Sum, 2)
+				DiskGb = $DiskInfo
 				LastStateChangeTime = $lastEvent.CreatedTime
 				LastStateChangeBy = $lastEvent.UserName
 			}
-			$Report += $row
+		}
+
+		# Initialize report array
+		$Report = @()
+
+		# Process VMs in parallel using jobs
+		$Jobs = @()
+		
+		# Create all jobs at once
+		foreach ($VM in $VMs) {
+			$Jobs += Start-Job -ScriptBlock $ProcessVM -ArgumentList $VM, $Datastores, $PowerEvents, $VMDisks[$VM.Id]
+			
+			# Wait if we've hit the throttle limit
+			while ((Get-Job -State Running).Count -ge $ThrottleLimit) {
+				$CompletedJobs = $Jobs | Where-Object { $_.State -eq "Completed" }
+				if ($CompletedJobs) {
+					$Report += Receive-Job -Job $CompletedJobs
+					Remove-Job -Job $CompletedJobs
+					$Jobs = $Jobs | Where-Object { $_.State -ne "Completed" }
+				}
+				Start-Sleep -Milliseconds 100
+			}
+		}
+
+		# Wait for remaining jobs and collect results
+		while ($Jobs) {
+			$CompletedJobs = $Jobs | Where-Object { $_.State -eq "Completed" }
+			if ($CompletedJobs) {
+				$Report += Receive-Job -Job $CompletedJobs
+				Remove-Job -Job $CompletedJobs
+				$Jobs = $Jobs | Where-Object { $_.State -ne "Completed" }
+			}
+			if ($Jobs) {
+				Start-Sleep -Milliseconds 100
+			}
 		}
 
 		# Sort and display results
